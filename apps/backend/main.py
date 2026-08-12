@@ -112,6 +112,19 @@ def list_repositories():
         session.close()
 
 
+def _require_repository(repository_id: int) -> None:
+    """A bad repository_id would otherwise silently return an empty result
+    (/search) or a confusing generic error deep in agent logic (/chat) instead of a
+    clean 404 — found in an independent review pass; /reindex already had this
+    check, /search and /chat didn't."""
+    session = get_session()
+    try:
+        if session.get(Repository, repository_id) is None:
+            raise HTTPException(404, f"repository_id {repository_id} not found")
+    finally:
+        session.close()
+
+
 class SearchQuery(BaseModel):
     repository_id: int
     query: str
@@ -122,6 +135,7 @@ class SearchQuery(BaseModel):
 def search(body: SearchQuery):
     """Direct hybrid retrieval, no LLM — used by the code explorer and for debugging
     retrieval quality independent of agent reasoning."""
+    _require_repository(body.repository_id)
     results = hybrid_search(body.repository_id, body.query, top_k=body.top_k)
     return {
         "results": [
@@ -147,6 +161,7 @@ class ChatIn(BaseModel):
 
 @app.post("/api/v1/chat")
 def chat(body: ChatIn):
+    _require_repository(body.repository_id)
     session = get_session()
     try:
         if body.conversation_id:
