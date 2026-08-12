@@ -18,6 +18,7 @@ EXT_TO_LANGUAGE = {
     ".mjs": "javascript",
     ".ts": "typescript",
     ".tsx": "typescript",
+    ".go": "go",
 }
 
 
@@ -34,6 +35,10 @@ def _load_language(name: str) -> Language:
         import tree_sitter_typescript as tsts
 
         return Language(tsts.language_typescript())
+    if name == "go":
+        import tree_sitter_go as tsgo
+
+        return Language(tsgo.language())
     raise ValueError(f"Unsupported language: {name}")
 
 
@@ -202,6 +207,100 @@ class TreeSitterJSParser(LanguageParser):
         )
 
 
+class TreeSitterGoParser(LanguageParser):
+    language = "go"
+
+    def __init__(self) -> None:
+        self._parser = Parser(_load_language("go"))
+
+    def analyze(self, file_path: str, source: str) -> FileAnalysis:
+        tree = self._parser.parse(source.encode("utf-8"))
+        root = tree.root_node
+        src_bytes = source.encode("utf-8")
+
+        imports: list[str] = []
+        symbols: list[Symbol] = []
+
+        def text(node: Node) -> str:
+            return src_bytes[node.start_byte : node.end_byte].decode("utf-8")
+
+        def collect_calls(node: Node) -> list[str]:
+            calls = []
+            for child in node.children:
+                if child.type == "call_expression":
+                    fn = child.child_by_field_name("function")
+                    if fn is not None:
+                        calls.append(text(fn).split(".")[-1])
+                calls.extend(collect_calls(child))
+            return calls
+
+        for node in root.children:
+            if node.type == "import_declaration":
+                imports.append(text(node).strip())
+            elif node.type == "type_declaration":
+                for spec in node.children:
+                    if spec.type == "type_spec":
+                        name_node = spec.child_by_field_name("name")
+                        struct_node = spec.child_by_field_name("type")
+                        if name_node is not None and struct_node is not None and struct_node.type == "struct_type":
+                            symbols.append(
+                                Symbol(
+                                    name=text(name_node),
+                                    kind="class",
+                                    file_path=file_path,
+                                    line_start=node.start_point[0] + 1,
+                                    line_end=node.end_point[0] + 1,
+                                    source=text(node),
+                                    calls=[],
+                                )
+                            )
+            elif node.type == "function_declaration":
+                name_node = node.child_by_field_name("name")
+                body_node = node.child_by_field_name("body")
+                name = text(name_node) if name_node else "<anon>"
+                symbols.append(
+                    Symbol(
+                        name=name,
+                        kind="function",
+                        file_path=file_path,
+                        line_start=node.start_point[0] + 1,
+                        line_end=node.end_point[0] + 1,
+                        source=text(node),
+                        calls=collect_calls(body_node) if body_node else [],
+                    )
+                )
+            elif node.type == "method_declaration":
+                name_node = node.child_by_field_name("name")
+                body_node = node.child_by_field_name("body")
+                receiver_node = node.child_by_field_name("receiver")
+                # receiver looks like "(s *Server)" — pull the type name out.
+                parent = None
+                if receiver_node is not None:
+                    receiver_text = text(receiver_node)
+                    parent = receiver_text.strip("()").split()[-1].lstrip("*") if receiver_text.strip("()") else None
+                name = text(name_node) if name_node else "<anon>"
+                symbols.append(
+                    Symbol(
+                        name=name,
+                        kind="method",
+                        file_path=file_path,
+                        line_start=node.start_point[0] + 1,
+                        line_end=node.end_point[0] + 1,
+                        source=text(node),
+                        parent=parent,
+                        calls=collect_calls(body_node) if body_node else [],
+                    )
+                )
+
+        return FileAnalysis(
+            file_path=file_path,
+            language=self.language,
+            imports=imports,
+            symbols=symbols,
+            line_count=source.count("\n") + 1,
+        )
+
+
 _PARSER_CACHE: dict[str, LanguageParser] = {}
 
 
@@ -211,6 +310,8 @@ def get_parser(language: str) -> LanguageParser:
             _PARSER_CACHE[language] = TreeSitterPythonParser()
         elif language in ("javascript", "typescript"):
             _PARSER_CACHE[language] = TreeSitterJSParser(language)
+        elif language == "go":
+            _PARSER_CACHE[language] = TreeSitterGoParser()
         else:
             raise ValueError(f"Unsupported language: {language}")
     return _PARSER_CACHE[language]

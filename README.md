@@ -5,18 +5,27 @@ repository and get evidence-grounded answers (with file:line citations), backed 
 tree-sitter code intelligence, hybrid (semantic + lexical) retrieval, a repository
 call graph, and Git history — not a wrapper around "vector search + LLM."
 
-**Status**: early, honest V1. See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for
-exactly what's built, verified, and not yet built — updated continuously, no
-fabricated claims.
+**Status**: real, working, honestly-scoped. See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)
+for exactly what's built, verified, and not yet built (DONE/PARTIAL/NOT IMPLEMENTED/
+BLOCKED) — updated continuously, no fabricated claims.
 
-## Quickstart
+## Quickstart — fully local, zero API keys
+
+Retrieval and the full agent both run with **no external API key** via
+[Ollama](https://ollama.com) — see [docs/OLLAMA.md](docs/OLLAMA.md) for why and how
+the local model was chosen.
+
+```bash
+ollama serve &                        # if not already running
+ollama pull qwen2.5:3b-instruct       # ~1.9GB, one-time
+```
 
 Backend (Python 3.14+):
 ```bash
 cd apps/backend
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt   # .venv/bin/pip on macOS/Linux
-cp ../../.env.example ../../.env                 # add ANTHROPIC_API_KEY to use /chat
+cp ../../.env.example ../../.env                 # defaults already point at Ollama
 .venv/Scripts/python -m uvicorn main:app --reload --port 8000
 ```
 
@@ -27,9 +36,26 @@ npm install
 npm run dev -- -p 3100
 ```
 
-Open http://localhost:3100, index a local repository by path, and ask it a question.
-Retrieval (`/api/v1/search`) works with zero API keys (local `fastembed` embeddings).
-The agent (`/api/v1/chat`) needs `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+Open http://localhost:3100, index a local repository by path (try one of
+`demo-repos/python-fastapi-app`, `demo-repos/typescript-app`,
+`demo-repos/go-service` — small fixture repos included for exactly this), and ask it
+a question. Prefer a hosted model instead? Set `LLM_PROVIDER=anthropic` +
+`ANTHROPIC_API_KEY` in `.env`.
+
+## What it can do today (verified live, not aspirational)
+
+- Answer grounded, cited questions about a codebase via the full agent loop
+  (investigate → tool calls → evidence → CONFIRMED/INFERRED/UNKNOWN answer).
+- Propose and apply a code fix: `POST /api/v1/fixes/propose` (read-only investigation
+  + patch proposal) → `POST /api/v1/fixes/apply` with `authorized: true` (isolated
+  git worktree → apply patch → run real tests in a sandbox → report the diff and
+  pass/fail — never claims success without actually running tests).
+- Voice in the browser (push-to-talk, live transcript, spoken answers) via the Web
+  Speech API — no server-side voice provider needed for this.
+
+See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for real measured behavior of
+the local model (it's a 3B CPU model — genuinely useful, not flawless; the honest
+numbers are there) and everything not yet built.
 
 ## Why this architecture
 

@@ -5,6 +5,7 @@ import sys
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from packages.agents.code_agent import apply_fix, get_diff, get_proposal, investigate_and_propose, store_proposal
 from packages.agents.state_machine import run_agent
 from packages.rag.indexer import index_repository
 from packages.rag.retrieval import hybrid_search, invalidate_bm25_cache
@@ -21,7 +23,14 @@ from packages.rag.store import Conversation, Message, Repository, get_session, i
 from packages.shared.config import settings
 from packages.shared.providers import OllamaProvider, ProviderNotConfiguredError
 
-app = FastAPI(title="CodeRAG Voice Engineer API", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="CodeRAG Voice Engineer API", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,11 +39,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    init_db()
 
 
 @app.exception_handler(Exception)
@@ -196,3 +200,75 @@ def reindex(repository_id: int):
         session.close()
     invalidate_bm25_cache(repository_id)
     return index_repository(name, root_path)
+
+
+class ProposeFixIn(BaseModel):
+    repository_id: int
+    instruction: str
+
+
+@app.post("/api/v1/fixes/propose")
+def propose_fix(body: ProposeFixIn):
+    """READ-only investigation + patch proposal. Never touches disk (spec module 32) —
+    apply_fix (below) is a separate call that requires explicit `authorized: true`."""
+    session = get_session()
+    try:
+        conv = Conversation(repository_id=body.repository_id)
+        session.add(conv)
+        session.commit()
+        session.refresh(conv)
+    finally:
+        session.close()
+    try:
+        proposal = investigate_and_propose(body.repository_id, conv.id, body.instruction)
+    except ProviderNotConfiguredError as e:
+        raise HTTPException(503, str(e))
+    proposal_id = store_proposal(proposal)
+    return {
+        "conversation_id": conv.id,
+        "proposal_id": proposal_id,
+        "diagnosis": proposal.diagnosis,
+        "citations": proposal.citations,
+        "patch": proposal.patch,
+        "confident": proposal.confident,
+    }
+
+
+class ApplyFixIn(BaseModel):
+    repository_id: int
+    proposal_id: str
+    authorized: bool  # required, no default — caller must explicitly opt in
+
+
+@app.post("/api/v1/fixes/apply")
+def apply_fix_endpoint(body: ApplyFixIn):
+    """WRITE + EXECUTE path. `authorized` must be true — this is the human-in-the-loop
+    gate from spec module 32/64; there is no route that applies a patch without it.
+
+    The patch is looked up server-side by `proposal_id` from what
+    investigate_and_propose actually produced — it is never accepted as free-form
+    text from the client. Without this, `authorized: true` would just be a boolean
+    the caller sets on themselves, and a client could POST an arbitrary hand-written
+    diff straight to this endpoint, which then runs auto-detected test commands via
+    the sandbox (found in code review: an unauthenticated RCE primitive)."""
+    if not body.authorized:
+        raise HTTPException(400, "authorized must be true to apply a code change.")
+
+    proposal = get_proposal(body.proposal_id)
+    if proposal is None:
+        raise HTTPException(404, "Unknown proposal_id — call /api/v1/fixes/propose first.")
+    if proposal.repository_id != body.repository_id:
+        raise HTTPException(400, "proposal_id does not belong to the given repository_id.")
+
+    result = apply_fix(body.repository_id, proposal)
+    diff = get_diff(result.worktree_path) if result.worktree_path else None
+    return {
+        "applied": result.applied,
+        "branch": result.branch,
+        "worktree_path": result.worktree_path,
+        "tests_passed": result.tests_passed,
+        "test_output": result.test_output,
+        "diff": diff,
+        "trace": result.trace,
+        "error": result.error,
+    }

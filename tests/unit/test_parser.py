@@ -40,6 +40,33 @@ def test_python_parser_handles_syntax_free_of_symbols():
     assert analysis.symbols == []
 
 
+def test_go_parser_extracts_struct_method_and_function():
+    src = """package main
+
+import "fmt"
+
+type Server struct {
+    Port int
+}
+
+func (s *Server) Start() error {
+    return listen(s.Port)
+}
+
+func NewServer(port int) *Server {
+    return &Server{Port: port}
+}
+"""
+    analysis = get_parser("go").analyze("server.go", src)
+    assert analysis.imports == ['import "fmt"']
+    by_name = {s.name: s for s in analysis.symbols}
+    assert by_name["Server"].kind == "class"
+    assert by_name["Start"].kind == "method"
+    assert by_name["Start"].parent == "Server"
+    assert "listen" in by_name["Start"].calls
+    assert by_name["NewServer"].kind == "function"
+
+
 def test_javascript_parser_extracts_function_and_class():
     src = """
 import { foo } from './foo';

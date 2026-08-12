@@ -255,13 +255,21 @@ class OllamaProvider(LLMProvider):
         raw_tool_calls = message.get("tool_calls") or []
         tool_calls = []
         for i, tc in enumerate(raw_tool_calls):
+            # Ollama frequently omits `id` on tool calls. The synthesized id must be
+            # written back into the raw dict (not just the parsed LLMToolCall) —
+            # raw_content is what gets echoed back as the assistant turn on the next
+            # loop iteration (_build_chat_style_messages), and the tool-result
+            # message state_machine.py sends back references call.id. If the two
+            # diverge, the resubmitted conversation has a tool-result tool_call_id
+            # that matches nothing in the preceding assistant turn (found in code
+            # review: real desync from iteration 2 onward on ids-omitted responses).
+            if not tc.get("id"):
+                tc["id"] = f"call_{i}"
             fn = tc.get("function", {})
             args = fn.get("arguments", {})
             if isinstance(args, str):
                 args = _safe_json(args)
-            tool_calls.append(
-                LLMToolCall(id=tc.get("id") or f"call_{i}", name=fn.get("name", ""), arguments=args)
-            )
+            tool_calls.append(LLMToolCall(id=tc["id"], name=fn.get("name", ""), arguments=args))
         raw_content = raw_tool_calls or None
         return LLMResponse(
             text=message.get("content", "") or "",
@@ -355,3 +363,28 @@ def get_llm_provider(settings) -> LLMProvider:
             raise ProviderNotConfiguredError("OPENAI_API_KEY is not set.")
         return OpenAIProvider(api_key=settings.openai_api_key)
     raise ValueError(f"Unknown LLM provider: {name}")
+
+
+# --- Voice provider interfaces (spec module 17-19) --------------------------------
+# Defined here so the abstraction exists and nothing in the agent/API layer would
+# need to change when a server-side implementation is added. NOT YET IMPLEMENTED:
+# no concrete subclass exists today. The frontend currently uses the browser's
+# native SpeechRecognition/speechSynthesis Web APIs directly (apps/frontend/app/
+# page.tsx) as a zero-dependency client-side fallback — that is real and working,
+# but it is not "this interface, implemented"; it bypasses the backend entirely.
+#
+# Deliberately not implemented in this environment: a local Whisper-family STT
+# (faster-whisper/whisper.cpp) needs a model download (~150MB-3GB depending on
+# size) that wasn't justified without a concrete need beyond what the browser
+# fallback already provides for local testing; a cloud STT/TTS provider
+# (Deepgram/ElevenLabs) needs an API key not present here (docs/INITIAL_AUDIT.md).
+# See docs/VOICE_ARCHITECTURE.md for the honest state and what implementing this
+# for real would require.
+class SpeechToTextProvider(ABC):
+    @abstractmethod
+    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> str: ...
+
+
+class TextToSpeechProvider(ABC):
+    @abstractmethod
+    def synthesize(self, text: str) -> bytes: ...  # returns audio bytes (e.g. WAV/MP3)

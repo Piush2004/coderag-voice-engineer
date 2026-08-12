@@ -4,6 +4,9 @@ __pycache__/
 node_modules/
 .next/
 data/
+# Demo fixture repos each have their own nested .git — keep them out of the main
+# repo's history (they're regenerable via scripts/ or the docs, not source).
+demo-repos/
 .env
 *.log
 .DS_Store

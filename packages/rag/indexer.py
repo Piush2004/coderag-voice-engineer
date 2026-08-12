@@ -6,9 +6,12 @@ skips anything over a size cap, and never follows symlinks out of the tree.
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from packages.code_intelligence.parser import detect_language, get_parser
 from packages.code_intelligence.symbols import FileAnalysis
@@ -116,7 +119,8 @@ def index_repository(name: str, root_path: str, progress_cb=None) -> dict:
                     parser = get_parser(language)
                     analysis: FileAnalysis = parser.analyze(rel, source)
                     parsed_count += 1
-                except Exception:
+                except Exception as e:  # noqa: BLE001 — one bad file must not abort indexing
+                    logger.warning("Parse failed for %s (%s): %s", rel, language, e)
                     analysis = FileAnalysis(rel, language, [], [], source.count("\n") + 1)
             else:
                 analysis = FileAnalysis(rel, "text", [], [], source.count("\n") + 1)

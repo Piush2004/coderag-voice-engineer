@@ -160,17 +160,28 @@ def get_session() -> Session:
     return SessionLocal()
 
 
+import threading
+
 _chroma_client = None
 _chroma_collection = None
+_chroma_lock = threading.Lock()
 
 
 def get_chroma_collection():
+    """Lazy singleton, guarded by a lock: FastAPI runs sync endpoints in a
+    threadpool, and concurrent unguarded calls here raced to construct two
+    chromadb.PersistentClient instances against the same path, which crashes
+    chromadb's Rust bindings (AttributeError: 'RustBindingsAPI' object has no
+    attribute 'bindings') — reproduced when a reindex request landed while the
+    process was still cold. See tests/rag/test_concurrent_chroma_init.py."""
     global _chroma_client, _chroma_collection
     if _chroma_collection is None:
-        import chromadb
+        with _chroma_lock:
+            if _chroma_collection is None:
+                import chromadb
 
-        _chroma_client = chromadb.PersistentClient(path=settings.chroma_path)
-        _chroma_collection = _chroma_client.get_or_create_collection(
-            name="code_chunks", metadata={"hnsw:space": "cosine"}
-        )
+                _chroma_client = chromadb.PersistentClient(path=settings.chroma_path)
+                _chroma_collection = _chroma_client.get_or_create_collection(
+                    name="code_chunks", metadata={"hnsw:space": "cosine"}
+                )
     return _chroma_collection

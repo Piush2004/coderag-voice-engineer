@@ -1,88 +1,137 @@
-# Project Status — 2026-08-13
+# Project Status — 2026-08-13 (updated: Ollama integration + code modification agent)
 
 Phase reference: [ARCHITECTURE.md](ARCHITECTURE.md) / [DECISIONS.md](DECISIONS.md).
 This file is the source of truth for what's real vs. not yet built — see spec rule 94
 ("do not fake anything"). Nothing below is claimed without evidence in this repo.
+Legend: **DONE** / **PARTIAL** / **NOT IMPLEMENTED** / **BLOCKED**.
 
-## Done (built, tested, verified end-to-end)
+## DONE — built, tested, verified end-to-end
 
-- **Phase 0–2 — Foundation.** Repo scaffolded, git initialized, Python 3.14 venv
-  (`apps/backend/.venv`) with all core deps installed and import-verified. Node 24
-  frontend scaffolded (Next.js 16 / React 19 / Tailwind 4).
-- **Phase 4–6 — Ingestion & code intelligence.** `packages/code_intelligence/parser.py`
-  — real tree-sitter parsing for Python/JS/TS, extracting classes/functions/methods,
-  imports, docstrings, and call references. `packages/rag/indexer.py` walks a repo
-  (path-traversal-safe, size-capped, binary-safe), parses, builds a code graph
-  (`calls`/`imports` edges in SQLite), pulls Git log via `git log --name-only` when
-  `.git` exists, and embeds every chunk into Chroma. **Verified**: indexed this
-  repository itself (20 files, 15 parsed, 99 chunks) and a synthetic fixture repo, in
-  ~15s cold (dominated by one-time fastembed model download).
-- **Phase 7 — Hybrid retrieval.** `packages/rag/retrieval.py` — semantic (Chroma) +
-  lexical (BM25) fused via reciprocal-rank fusion, metadata filtering by chunk type.
-  **Measured** on a 6-query fixture benchmark
-  (`evaluation/retrieval_benchmark.py`): **Recall@5 = 1.00, MRR = 1.00** (n=6 — small
-  and self-authored; not a claim of production-scale accuracy).
-- **Phase 8 — Agent orchestration.** `packages/agents/state_machine.py` — bounded
-  tool-calling loop (max iterations/tool calls/timeout, duplicate-call suppression),
-  evidence-first system prompt (CONFIRMED/INFERRED/UNKNOWN), explicit prompt-injection
-  instruction telling the model retrieved content is data not commands. Seven READ
-  tools in `packages/agents/tools.py` (`search_code`, `search_symbols`,
-  `find_callers`, `find_callees`, `find_tests`, `search_git_history`, `inspect_file`)
-  — **verified** directly against real indexed data (correct results, correct
-  file:line citations).
-- **Backend API.** FastAPI app (`apps/backend/main.py`): `/api/v1/health`,
-  `/repositories` (register+index), `/search` (retrieval only, no LLM),
-  `/chat` (full agent loop), `/repositories/{id}/reindex`. Global exception handler
-  returns a request ID instead of leaking stack traces. **Verified** live via curl and
-  via the browser through the real frontend.
-- **Frontend.** Next.js voice console (`apps/frontend/app/page.tsx`): repo
-  index/select, chat transcript, citations, agent trace ("Searching code for...",
-  etc. — no chain-of-thought exposure per spec rule 87), push-to-talk mic using the
-  browser Web Speech API, TTS via `speechSynthesis`, interrupt/stop button.
-  **Verified** in-browser end-to-end: indexed this repo through the UI, sent a chat
-  message, got the correct, honest error (see below) rendered with no crash.
-- **Tests.** 9 real pytest tests (`tests/unit`, `tests/rag`) covering parser, chunker,
-  and a full index→retrieve integration path against an isolated temp DB. **All
-  passing** (`apps/backend/.venv/Scripts/python.exe -m pytest -q` → `9 passed`).
+- **Foundation.** Git repo, Python 3.14 venv, Node 24 frontend (Next.js 16/React 19).
+- **Code intelligence.** tree-sitter parsing for **Python, JavaScript, TypeScript,
+  and Go** (Go added this session — `packages/code_intelligence/parser.py`).
+  Extracts classes/structs, functions, methods, imports, docstrings, call
+  references. 6 parser unit tests passing, one per language's class/method/call
+  extraction.
+- **Ingestion.** `packages/rag/indexer.py` — path-traversal-safe, size-capped,
+  binary-safe file discovery; code-aware chunking; call/import graph edges; Git log
+  ingestion. **Secret redaction runs on every chunk before storage** (new this
+  session — `packages/rag/secrets.py`, 7 tests, catches AWS/GitHub/Slack keys, PEM
+  blocks, JWTs, DB connection strings, generic key/token/password assignments).
+- **Hybrid retrieval.** Semantic (Chroma) + lexical (BM25) via reciprocal-rank
+  fusion. Measured on the 6-query fixture: **Recall@5 = 1.00, MRR = 1.00** (small,
+  self-authored — see [EVALUATION.md](EVALUATION.md)).
+- **No overfitting to the CodeRAG codebase itself** — verified against 3 independent
+  demo repos in `demo-repos/` (Python/FastAPI, TypeScript, Go), each indexed and
+  retrieval-tested with correct top-1 results on natural-language queries (e.g. "how
+  is the cart subtotal calculated" → `src/cart.ts::Cart.subtotal` in the TS repo).
+- **Local LLM via Ollama — the headline addition this session.**
+  `packages/shared/providers.py::OllamaProvider`, default `LLM_PROVIDER`, no API key
+  required. Model: `qwen2.5:3b-instruct` (chosen after `nemotron-mini` — already
+  installed — failed a direct tool-call test; see [OLLAMA.md](OLLAMA.md) for the full
+  selection rationale). `GET /api/v1/health/llm` proactive health check.
+  **The full agent loop was verified live and end-to-end**: FastAPI → agent
+  orchestrator → Ollama → tool selection → tool execution → evidence → grounded
+  answer with correct file:line citations. Example (real, not paraphrased): asked
+  "Where is hybrid retrieval implemented?", the agent called `search_code`, and
+  answered "...found in `packages/rag/retrieval.py`... [file:1:packages/rag/
+  retrieval.py:hybrid_search:55-123]" — verified correct.
+- **A real concurrency bug found and fixed during this testing**: two FastAPI
+  threadpool threads racing to construct `chromadb.PersistentClient` on first
+  access crashed chromadb's Rust bindings
+  (`AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'`). Fixed
+  with a lock around the lazy singleton in `packages/rag/store.py`; regression test
+  in `tests/rag/test_concurrent_chroma_init.py` reproduces it with 8 racing threads.
+- **Code modification agent** (new this session — `packages/agents/code_agent.py`):
+  investigate → propose patch → **explicit `authorized: true` gate** → isolated
+  `git worktree` → apply → run tests in a subprocess sandbox → report diff. Real
+  finding from live testing: the LLM's first patch attempt for unified-diff format
+  was unreliable (small models struggle with diff syntax), so the design was changed
+  to have the LLM output the corrected whole file and compute the diff with
+  `difflib` instead — moving the hard part out of the model's hands. Even so, a live
+  run against the real bug in `demo-repos/python-fastapi-app` produced a patch that
+  silently dropped unrelated code (`Order` class, `calculate_total`) — **the system
+  correctly did not report success**: it applied the patch, ran the real test suite
+  in the sandbox, and reported `tests_passed: false` with the actual `ImportError`.
+  This exact behavior (correct patch → tests pass; broken patch → tests correctly
+  fail, never fabricated success) is locked in by 4 deterministic tests in
+  `tests/rag/test_code_agent.py` that don't depend on live LLM output.
+- **Security pass** (`docs/SECURITY.md` has the full breakdown): secret redaction
+  (done, tested), path-traversal fuzzing (done, tested — symlink-escape test present
+  but skipped on Windows, needs elevated privileges to create symlinks there),
+  command-injection audit (done — only one `subprocess.run` call anywhere in
+  `packages/`, fixed argv, no `shell=True`, no `eval`/`exec`), write-path
+  authorization gate (done, tested). Sandbox isolation, auth/multi-tenancy, and rate
+  limiting remain real gaps — see below.
+- **Backend API additions**: `/api/v1/health/llm`, `/api/v1/fixes/propose`,
+  `/api/v1/fixes/apply`.
+- **Tests**: 26 passing, 1 skipped (Windows symlink privilege requirement) —
+  `apps/backend/.venv/Scripts/python.exe -m pytest -q`.
 
-## Explicitly NOT working / NOT built yet
+## Real, measured local-model behavior (not idealized)
 
-- **LLM calls are untested end-to-end.** No `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is
-  available in this environment ([INITIAL_AUDIT.md](INITIAL_AUDIT.md)). The full
-  `/api/v1/chat` path is wired and returns a correct, honest 503
-  ("ANTHROPIC_API_KEY is not set...") rather than a fabricated answer. Add a key to
-  `.env` to exercise it live.
-- **Server-side streaming STT/TTS** (Deepgram/ElevenLabs providers) — interfaces
-  exist in `docs/DECISIONS.md`'s plan but are not implemented; only the browser
-  Web Speech fallback is wired into the frontend today.
-- **Code modification agent** (propose → authorize → patch → test → verify), **test
-  generation agent**, **impact analysis agent**, **bug investigation agent** as
-  distinct flows — not built. The general query agent can answer these questions via
-  its tools today but there's no dedicated PROPOSE/AUTHORIZE/MODIFY state, no
-  `Sandbox` execution backend, no patch/diff generation.
-- **GitHub/upload repository ingestion** — only local filesystem paths are supported.
-- **Auth, multi-tenancy, workspaces** — not built; single implicit user, no login.
-- **Background job queue for indexing** — indexing is currently synchronous in the
-  request; fine for small repos, will time out on very large ones.
-- **Postgres/pgvector, Redis, Docker, docker-compose, CI/CD** — not built; V1 runs on
-  SQLite+Chroma+BM25 with no daemons (see [DECISIONS.md](DECISIONS.md)). Docker
-  wasn't available in this environment to build/test against.
-- **Security hardening pass** (prompt-injection red-teaming, secret redaction,
-  path-traversal fuzzing beyond the basic checks in `indexer.py`, rate limiting) —
-  not done.
-- **Reranker model, query rewriting, graph-based retrieval fusion** — RRF fusion of
-  semantic+lexical is the only ranking signal today; no cross-encoder reranker or
-  LLM-based query rewriting yet.
-- **Evaluation dataset** is a 6-query synthetic fixture, not the "easy/medium/hard/
-  multi-hop/adversarial" benchmark the full spec calls for.
-- **Observability UI, deployment, architecture graph visualization** — not built.
+From `evaluation/adhoc_probe.py` (the exact 10 questions from the task brief, run
+live against this repo — full output in git history / rerun anytime):
+
+| Result | Count |
+|---|---|
+| Grounded answer with correct citations | 3/10 |
+| Correctly said UNKNOWN after searching but not finding enough | 2/10 |
+| Said UNKNOWN **without calling a tool first**, despite evidence existing | 4/10 |
+| Vague/incomplete answer, 0 tool calls | 1/10 |
+
+This is an honest, real limitation of a 3B-parameter CPU-inference model, not a bug
+in the orchestrator (loop protection, tool execution, and citation extraction are
+independently verified via direct tests). See [OLLAMA.md](OLLAMA.md) for detail and
+the recommended fix (a larger local model, swappable via `OLLAMA_MODEL` with zero
+code changes).
+
+The larger 28-case categorized eval (`evaluation/agent_eval.py`, architecture/code-
+nav/dependency/debugging/git/RAG/agent/security/no-answer/multi-hop) was run live
+during this session — results are in `evaluation/agent_eval_results.json` once the
+run completes; this file is updated with the summary once available rather than
+guessed at here.
+
+## NOT IMPLEMENTED (real gaps, explicit)
+
+- **Server-side voice (STT/TTS providers)** — interfaces exist
+  (`packages/shared/providers.py`), no concrete implementation. Browser Web Speech
+  API fallback is real and working client-side. See
+  [VOICE_ARCHITECTURE.md](VOICE_ARCHITECTURE.md).
+- **Test generation agent, impact analysis agent, debugging agent** as distinct
+  flows — the general query agent and the code modification agent's investigation
+  step can answer these questions today, but there's no dedicated specialized
+  workflow/prompt for each.
+- **GitHub/upload/ZIP repository ingestion** — local filesystem paths only.
+- **Auth, multi-tenancy, workspace isolation, rate limiting** — none. Single
+  implicit user; anyone with network access to the API can index/query any local
+  path the server can read. Required before any shared/networked deployment.
+- **Background job queue for indexing** — synchronous in the request; fine for
+  small/medium repos (demo repos indexed in 1-15s), would need Celery/RQ for very
+  large ones or concurrent indexing.
+- **Real container sandboxing** — the code-modification agent's test execution is a
+  subprocess with a timeout, not a real security sandbox (no Docker in this
+  environment — see [SECURITY.md](SECURITY.md)). Fine for running a repo's own
+  tests; not safe against adversarial/untrusted repositories.
+- **Postgres/pgvector, Redis, Docker, docker-compose, CI/CD, deployment** — not
+  built; see [DEPLOYMENT.md](DEPLOYMENT.md) for exactly what's missing and why.
+- **Reranker model, query rewriting, graph-based retrieval fusion beyond RRF.**
+- **Observability UI, architecture graph visualization.**
+
+## BLOCKED (needs something this environment doesn't have)
+
+- Docker-backed sandbox and deployment: no Docker installed.
+- Cloud STT/TTS and Anthropic/OpenAI-backed chat: no API keys present (Ollama
+  removes the blocker for local dev/testing specifically; cloud providers remain
+  optional and untested end-to-end here).
 
 ## Recommended next slice
 
-1. User supplies `ANTHROPIC_API_KEY` in `.env` → verify the live agent loop end-to-end
-   (this is the highest-value next step; everything else is built assuming it works).
-2. Code modification agent (propose/authorize/patch/test/verify) with a subprocess
-   sandbox.
-3. Expand the eval benchmark and add a security pass (prompt-injection tests,
-   secret-redaction tests).
-4. Docker Compose + Postgres/pgvector swap, CI workflow.
+1. Try a larger local model (`OLLAMA_MODEL=qwen2.5-coder:7b` or similar) to see if
+   the "answers UNKNOWN without searching" failure mode improves — this is the
+   single highest-leverage lever on answer quality right now.
+2. Docker + docker-compose + CI (all documented as not-yet-built, not attempted
+   without a way to verify them in this environment).
+3. Auth/workspace isolation before any networked deployment.
+4. A real container sandbox for code execution before running against untrusted
+   repositories.

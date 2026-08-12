@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from packages.code_intelligence.symbols import FileAnalysis
+from packages.rag.secrets import redact
 
 
 @dataclass
@@ -82,4 +83,6 @@ def chunk_file(repository_id: int, analysis: FileAnalysis, source: str) -> list[
                 content=f"# {analysis.file_path}\n" + source,
             )
         )
+    for c in chunks:
+        c.content, _ = redact(c.content)
     return chunks
