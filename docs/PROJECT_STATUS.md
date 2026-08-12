@@ -86,11 +86,51 @@ independently verified via direct tests). See [OLLAMA.md](OLLAMA.md) for detail 
 the recommended fix (a larger local model, swappable via `OLLAMA_MODEL` with zero
 code changes).
 
-The larger 28-case categorized eval (`evaluation/agent_eval.py`, architecture/code-
+The larger 29-case categorized eval (`evaluation/agent_eval.py`, architecture/code-
 nav/dependency/debugging/git/RAG/agent/security/no-answer/multi-hop) was run live
-during this session — results are in `evaluation/agent_eval_results.json` once the
-run completes; this file is updated with the summary once available rather than
-guessed at here.
+against this repository:
+
+| Category | Result |
+|---|---|
+| architecture | 2/3 |
+| code_navigation | 3/5 |
+| dependency | 2/3 |
+| debugging | 1/3 |
+| git | 2/2 |
+| rag | 1/3 |
+| agent | 1/3 |
+| security | 2/3 |
+| no_answer | 2/2 |
+| multi_hop | 2/2 |
+| **Overall** | **18/29 (62%)** |
+
+Full output in `evaluation/agent_eval_results.json` (includes every answer verbatim).
+The first run of this eval scored 59% but was re-run after a real bug was found in
+the *scorer itself*: it required `no_answer` cases to have zero citations, but
+`citations` reflects every chunk `search_code` surfaced during investigation, not
+claims actually made in the final answer — a correct "UNKNOWN" answer with prior
+search activity was wrongly marked as a failure. Fixed; both `no_answer` cases now
+correctly pass (verified live: asked "What is the production AWS account ID?", got
+back exactly `"UNKNOWN"` — not a hallucination).
+
+The real failures in the corrected run fall into two genuine patterns, not eval
+artifacts:
+1. **Skips tool use, answers from general knowledge or gives up** (~7 of 11
+   failures) — e.g. asked "How does the agent avoid infinite tool-calling loops?", it
+   answered with a generic description of how agents *typically* prevent loops
+   (plausible-sounding, not wrong, but never looked at this repo's actual
+   `max_iterations`/`max_tool_calls` logic — a real evidence-grounding failure, not a
+   factual one).
+2. **Wrong specific answer despite gathering evidence** (rarer, more concerning) —
+   asked "Which function performs code-aware chunking?", it had 3 citations from a
+   real search but answered `search_code` (the retrieval function) instead of
+   `chunk_file` (the actual chunking function) — a genuine misattribution, not
+   fabricated evidence but misread evidence.
+
+Neither pattern is a bug in the orchestrator, evidence collection, or citation
+extraction — all independently verified via deterministic tests. This is real,
+measured behavior of a 3B-parameter CPU-inference model. See
+[OLLAMA.md](OLLAMA.md) for the recommended next step (try a larger local model).
 
 ## NOT IMPLEMENTED (real gaps, explicit)
 
