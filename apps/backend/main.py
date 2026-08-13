@@ -15,8 +15,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from packages.agents.code_agent import apply_fix, get_diff, get_proposal, investigate_and_propose, store_proposal
-from packages.agents.state_machine import run_agent
+from packages.agents.code_agent import (
+    apply_fix,
+    generate_tests,
+    get_diff,
+    get_proposal,
+    investigate_and_propose,
+    store_proposal,
+)
+from packages.agents.state_machine import run_agent, run_debug_agent
 from packages.rag.indexer import index_repository
 from packages.rag.retrieval import hybrid_search, invalidate_bm25_cache
 from packages.rag.store import Conversation, Message, Repository, get_session, init_db
@@ -203,6 +210,58 @@ def chat(body: ChatIn):
     }
 
 
+class DebugIn(BaseModel):
+    repository_id: int
+    problem: str  # error message, stack trace, failing test name, or bug description
+    conversation_id: Optional[int] = None
+
+
+@app.post("/api/v1/debug")
+def debug(body: DebugIn):
+    """Dedicated debugging workflow (spec Phase 11): same bounded agent loop as
+    /chat, but a ranked-hypothesis system prompt (CONFIRMED/HYPOTHESIS/INFERRED/
+    UNKNOWN instead of the general agent's 3-way CONFIRMED/INFERRED/UNKNOWN)."""
+    _require_repository(body.repository_id)
+    session = get_session()
+    try:
+        if body.conversation_id:
+            conv = session.get(Conversation, body.conversation_id)
+            if conv is None:
+                raise HTTPException(404, "conversation not found")
+        else:
+            conv = Conversation(repository_id=body.repository_id)
+            session.add(conv)
+            session.commit()
+            session.refresh(conv)
+        session.add(Message(conversation_id=conv.id, role="user", content=body.problem))
+        session.commit()
+    finally:
+        session.close()
+
+    t0 = time.monotonic()
+    try:
+        result = run_debug_agent(body.repository_id, conv.id, body.problem)
+    except ProviderNotConfiguredError as e:
+        raise HTTPException(503, str(e))
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    session = get_session()
+    try:
+        session.add(Message(conversation_id=conv.id, role="assistant", content=result.answer))
+        session.commit()
+    finally:
+        session.close()
+
+    return {
+        "conversation_id": conv.id,
+        "answer": result.answer,
+        "citations": result.citations,
+        "trace": result.trace,
+        "status": result.status,
+        "latency_ms": latency_ms,
+    }
+
+
 @app.post("/api/v1/repositories/{repository_id}/reindex")
 def reindex(repository_id: int):
     session = get_session()
@@ -236,6 +295,42 @@ def propose_fix(body: ProposeFixIn):
         session.close()
     try:
         proposal = investigate_and_propose(body.repository_id, conv.id, body.instruction)
+    except ProviderNotConfiguredError as e:
+        raise HTTPException(503, str(e))
+    proposal_id = store_proposal(proposal)
+    return {
+        "conversation_id": conv.id,
+        "proposal_id": proposal_id,
+        "diagnosis": proposal.diagnosis,
+        "citations": proposal.citations,
+        "patch": proposal.patch,
+        "confident": proposal.confident,
+    }
+
+
+class GenerateTestsIn(BaseModel):
+    repository_id: int
+    target: str  # e.g. "the apply_discount function in app/pricing.py"
+
+
+@app.post("/api/v1/tests/generate")
+def generate_tests_endpoint(body: GenerateTestsIn):
+    """Test generation agent (spec Phase 13). READ-only — produces a proposal the
+    same way /fixes/propose does; apply it (write the test file + actually run it)
+    via the same /api/v1/fixes/apply with the returned proposal_id. This reuses the
+    bug-fix flow's apply path rather than a separate one, so it inherits the same
+    authorization gate and path-containment checks without duplicating them."""
+    _require_repository(body.repository_id)
+    session = get_session()
+    try:
+        conv = Conversation(repository_id=body.repository_id)
+        session.add(conv)
+        session.commit()
+        session.refresh(conv)
+    finally:
+        session.close()
+    try:
+        proposal = generate_tests(body.repository_id, conv.id, body.target)
     except ProviderNotConfiguredError as e:
         raise HTTPException(503, str(e))
     proposal_id = store_proposal(proposal)

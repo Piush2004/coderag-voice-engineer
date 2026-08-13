@@ -42,6 +42,32 @@ a snippet>
 Modify only one file. If you cannot produce a confident fix from the available \
 evidence, respond with exactly: NO_CONFIDENT_FIX"""
 
+# Test generation (spec Phase 13) reuses the exact same "propose whole file, diff it
+# ourselves, apply in an isolated worktree, run tests for real" pipeline as a bug fix
+# — the only difference is this system prompt and how the investigation instruction
+# is framed. Never claim a generated test passes without actually running it: that
+# guarantee comes from apply_fix, unchanged, which always executes the real test
+# command in the sandbox before reporting pass/fail.
+TEST_GEN_SYSTEM_PROMPT = """You are writing a test for a specific function/class in \
+a real codebase. You have already investigated the codebase and existing test style; \
+the evidence is in the conversation — including, if found, an example of this \
+repository's existing test file for related code, which you MUST match the style of \
+(same test framework, same naming convention, same assertion style). Respond with \
+EXACTLY this format and nothing else:
+
+FILE: <repo-relative path of the test file to write to — reuse an existing test file \
+for the same module if one exists, otherwise create a new one following this \
+repository's existing test file naming/location convention>
+```
+<the complete new content of that test file — if the file already exists, this must \
+be the existing content PLUS your new test(s) appended, not a replacement>
+```
+
+Write at least one meaningful test that actually exercises the target's real \
+behavior (not a placeholder `assert True`). If you cannot determine the target's \
+behavior confidently enough to write a real test, respond with exactly: \
+NO_CONFIDENT_FIX"""
+
 
 @dataclass
 class FixProposal:
@@ -93,6 +119,32 @@ def investigate_and_propose(repository_id: int, conversation_id: int, instructio
     for the corrected file content and computes a real unified diff ourselves
     (difflib) rather than trusting the model to hand-write diff syntax. Never
     touches disk."""
+    return _propose_file_change(repository_id, conversation_id, instruction, PATCH_SYSTEM_PROMPT)
+
+
+def generate_tests(repository_id: int, conversation_id: int, target_description: str) -> FixProposal:
+    """Read-only: investigates the target and existing test style (via find_tests/
+    inspect_file, same as any other agent run), then proposes a new/extended test
+    file. Never touches disk or runs anything — apply_fix (shared with the bug-fix
+    flow) is the only path that writes+executes, and only behind the same
+    authorization gate."""
+    instruction = (
+        f"Write a test for: {target_description}. First find the target's current "
+        f"behavior and look for this repository's existing test file(s) for related "
+        f"code (use find_tests and inspect_file) so the new test matches the "
+        f"existing style."
+    )
+    return _propose_file_change(repository_id, conversation_id, instruction, TEST_GEN_SYSTEM_PROMPT)
+
+
+def _propose_file_change(
+    repository_id: int, conversation_id: int, instruction: str, system_prompt: str
+) -> FixProposal:
+    """Shared mechanics behind investigate_and_propose and generate_tests: both are
+    "investigate, then ask the LLM for a whole file's new content, then diff it
+    ourselves" — the only real difference is the system prompt. New files (e.g. a
+    test file that doesn't exist yet) are supported: an absent target is treated as
+    empty content rather than rejected."""
     diagnosis_result = run_agent(repository_id, conversation_id, instruction)
 
     session = get_session()
@@ -106,22 +158,28 @@ def investigate_and_propose(repository_id: int, conversation_id: int, instructio
     patch_prompt = (
         f"Task: {instruction}\n\nDiagnosis from investigation:\n{diagnosis_result.answer}\n\n"
         f"Evidence citations: {diagnosis_result.citations}\n\n"
-        "Now produce the corrected file, as instructed."
+        "Now produce the file, as instructed."
     )
     resp = llm.complete(
         [LLMMessage(role="user", content=patch_prompt)],
-        system=PATCH_SYSTEM_PROMPT,
+        system=system_prompt,
         tools=None,
         max_tokens=3000,
     )
     raw = resp.text.strip()
 
+    def _not_confident() -> FixProposal:
+        return FixProposal(
+            diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False,
+            repository_id=repository_id,
+        )
+
     if not raw or "NO_CONFIDENT_FIX" in raw or repo_root is None:
-        return FixProposal(diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False, repository_id=repository_id)
+        return _not_confident()
 
     match = _FILE_BLOCK_RE.search(raw)
     if not match:
-        return FixProposal(diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False, repository_id=repository_id)
+        return _not_confident()
 
     rel_path, new_content = match.group(1).strip(), match.group(2)
     if new_content.endswith("\n") is False:
@@ -131,26 +189,25 @@ def investigate_and_propose(repository_id: int, conversation_id: int, instructio
     # relative path. `Path("/repo") / "/etc/passwd"` resolves to "/etc/passwd" (the
     # `/` operator discards the left side entirely for an absolute right side), and
     # "../../etc/passwd" would escape repo_root even without that quirk. Resolve and
-    # verify containment before ever reading the target (found in code review: this
+    # verify containment before ever touching the target (found in code review: this
     # was reachable as an arbitrary-file-read via the *read-only* propose endpoint).
     repo_root_resolved = repo_root.resolve()
     target = (repo_root / rel_path).resolve()
     try:
         target.relative_to(repo_root_resolved)
     except ValueError:
-        return FixProposal(diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False, repository_id=repository_id)
-    if not target.exists():
-        return FixProposal(diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False, repository_id=repository_id)
+        return _not_confident()
 
-    old_content = target.read_text(encoding="utf-8")
+    is_new_file = not target.exists()
+    old_content = "" if is_new_file else target.read_text(encoding="utf-8")
     if old_content == new_content:
-        return FixProposal(diagnosis_result.answer, diagnosis_result.citations, patch=None, confident=False, repository_id=repository_id)
+        return _not_confident()
 
     diff = "".join(
         difflib.unified_diff(
             old_content.splitlines(keepends=True),
             new_content.splitlines(keepends=True),
-            fromfile=f"a/{rel_path}",
+            fromfile="/dev/null" if is_new_file else f"a/{rel_path}",
             tofile=f"b/{rel_path}",
         )
     )
