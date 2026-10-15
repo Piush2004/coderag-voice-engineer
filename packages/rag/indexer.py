@@ -36,14 +36,33 @@ IGNORED_DIRS = {
 }
 
 
+def _find_nested_repo_roots(root: Path) -> list[Path]:
+    """Directories other than `root` itself that are their own git repository (have
+    a `.git` entry directly inside them). Found via a real bug: indexing this
+    project's own root walked straight into demo-repos/*/  (each its own git repo,
+    gitignored for *this* repo but that's irrelevant to a filesystem walk, which
+    doesn't consult .gitignore at all) and silently mixed 30 unrelated chunks into
+    this repository's index. A parent repository should never swallow a nested
+    repository's content as if it were its own source."""
+    nested = []
+    for git_entry in root.rglob(".git"):
+        parent = git_entry.parent
+        if parent != root:
+            nested.append(parent)
+    return nested
+
+
 def discover_files(root: Path) -> list[Path]:
     root = root.resolve()
     data_dir = Path(settings.chroma_path).resolve().parent
+    nested_repo_roots = _find_nested_repo_roots(root)
     files = []
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         if any(part in IGNORED_DIRS for part in p.parts):
+            continue
+        if any(nested in p.parents for nested in nested_repo_roots):
             continue
         resolved = p.resolve()
         try:
